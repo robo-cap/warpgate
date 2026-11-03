@@ -9561,6 +9561,7 @@ dependencies = [
  "openidconnect",
  "rcgen",
  "reqwest 0.12.28",
+ "rustls",
  "schemars 1.2.2",
  "serde",
  "serde_json",

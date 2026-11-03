@@ -396,6 +396,7 @@ pub mod tests {
         let issuer = "https://identity.oraclecloud.com/";
         let (first, first_task) = discovery_server(Some(issuer)).await;
         let (second, second_task) = discovery_server(Some(issuer)).await;
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = openidconnect::reqwest::Client::new();
         let first_config = custom_config(issuer, Some(format!("{first}/discovery")));
         let second_config = custom_config(issuer, Some(format!("{second}/discovery")));
@@ -433,6 +434,7 @@ pub mod tests {
     async fn standard_discovery_still_works_without_an_override() {
         let (base, task) = discovery_server(None).await;
         let config = custom_config(&base, None);
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let client = openidconnect::reqwest::Client::new();
         let metadata = super::discover_metadata(&config, &client).await.unwrap();
         assert_eq!(
