@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use openidconnect::url::Url;
-use openidconnect::{ProviderMetadataWithLogout, reqwest};
+use openidconnect::{AsyncHttpClient, HttpRequest, ProviderMetadataWithLogout, http, reqwest};
 use tokio::sync::Mutex;
 use warpgate_common_cache::Cache;
 
@@ -23,12 +23,13 @@ const METADATA_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(10);
 /// providers reached over a trusted network (test rigs, in-cluster IdPs).
 const ALLOWED_ENDPOINT_SCHEMES: [&str; 2] = ["https", "http"];
 
-/// Key = issuer URL
-static METADATA_CACHE: LazyLock<Cache<String, (), ProviderMetadataWithLogout>> =
+// Providers can share an issuer while using different tenant metadata and keys.
+type MetadataCacheKey = (String, Option<String>);
+
+static METADATA_CACHE: LazyLock<Cache<MetadataCacheKey, (), ProviderMetadataWithLogout>> =
     LazyLock::new(|| Cache::new(METADATA_CACHE_TTL));
 
-/// Key = issuer URL
-static LAST_FORCED_CACHE_EVICTION: LazyLock<Mutex<HashMap<String, Instant>>> =
+static LAST_FORCED_CACHE_EVICTION: LazyLock<Mutex<HashMap<MetadataCacheKey, Instant>>> =
     LazyLock::new(Default::default);
 
 /// Render an error together with its whole `source` chain.
@@ -113,9 +114,33 @@ pub async fn discover_metadata(
     http_client: &reqwest::Client,
 ) -> Result<ProviderMetadataWithLogout, SsoError> {
     let issuer = config.issuer_url()?;
+    let key = metadata_cache_key(config)?;
+    let default_discovery_url = format!(
+        "{}/.well-known/openid-configuration",
+        issuer.as_str().trim_end_matches('/')
+    );
+    let discovery_uri = config
+        .discovery_url()
+        .map(|url| {
+            check_endpoint_scheme("discovery_url", url)?;
+            url.as_str()
+                .parse::<http::Uri>()
+                .map_err(|e| SsoError::ConfigError(format!("invalid discovery_url: {e}")))
+        })
+        .transpose()?;
     METADATA_CACHE
-        .get_or_build(&issuer.to_string(), &(), || async {
-            let metadata = ProviderMetadataWithLogout::discover_async(issuer, http_client)
+        .get_or_build(&key, &(), || async {
+            // Redirect only the discovery fetch. The OIDC library still validates
+            // the advertised issuer and fetches the advertised JWKS normally.
+            let discovery_client = |mut request: HttpRequest| {
+                if request.uri().to_string() == default_discovery_url
+                    && let Some(uri) = &discovery_uri
+                {
+                    *request.uri_mut() = uri.clone();
+                }
+                http_client.call(request)
+            };
+            let metadata = ProviderMetadataWithLogout::discover_async(issuer, &discovery_client)
                 .await
                 .map_err(|e| SsoError::Discovery(describe_error(&e)))?;
 
@@ -127,17 +152,24 @@ pub async fn discover_metadata(
         .await
 }
 
+fn metadata_cache_key(config: &SsoInternalProviderConfig) -> Result<MetadataCacheKey, SsoError> {
+    Ok((
+        config.issuer_url()?.to_string(),
+        config.discovery_url().map(ToString::to_string),
+    ))
+}
+
 /// false = not evicted due to interval check
-async fn evict_for_forced_refresh(issuer: &str) -> bool {
+async fn evict_for_forced_refresh(key: &MetadataCacheKey) -> bool {
     let mut last = LAST_FORCED_CACHE_EVICTION.lock().await;
     if last
-        .get(issuer)
+        .get(key)
         .is_some_and(|at| at.elapsed() < METADATA_REFRESH_MIN_INTERVAL)
     {
         return false;
     }
-    last.insert(issuer.to_owned(), Instant::now());
-    METADATA_CACHE.remove(&issuer.to_owned());
+    last.insert(key.clone(), Instant::now());
+    METADATA_CACHE.remove(key);
     true
 }
 
@@ -145,7 +177,7 @@ pub async fn refresh_metadata(
     config: &SsoInternalProviderConfig,
     http_client: &reqwest::Client,
 ) -> Result<ProviderMetadataWithLogout, SsoError> {
-    evict_for_forced_refresh(&config.issuer_url()?.to_string()).await;
+    evict_for_forced_refresh(&metadata_cache_key(config)?).await;
     discover_metadata(config, http_client).await
 }
 
@@ -299,9 +331,113 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn forced_refresh_is_throttled_per_issuer() {
-        assert!(evict_for_forced_refresh("https://a.example").await);
-        assert!(!evict_for_forced_refresh("https://a.example").await);
-        assert!(evict_for_forced_refresh("https://b.example").await);
+    async fn forced_refresh_is_throttled_per_metadata_source() {
+        let a = ("https://a.example".to_owned(), None);
+        let b = ("https://b.example".to_owned(), None);
+        let tenant = (
+            a.0.clone(),
+            Some("https://tenant.example/discovery".to_owned()),
+        );
+        assert!(evict_for_forced_refresh(&a).await);
+        assert!(!evict_for_forced_refresh(&a).await);
+        assert!(evict_for_forced_refresh(&b).await);
+        assert!(evict_for_forced_refresh(&tenant).await);
+    }
+
+    async fn discovery_server(issuer: Option<&str>) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let document = json!({
+            "issuer": issuer.unwrap_or(&base),
+            "authorization_endpoint": format!("{base}/authorize"),
+            "jwks_uri": format!("{base}/keys"),
+            "response_types_supported": ["code"],
+            "subject_types_supported": ["public"],
+            "id_token_signing_alg_values_supported": ["RS256"],
+        })
+        .to_string();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let size = socket.read(&mut request).await.unwrap();
+                let body = if request[..size].starts_with(b"GET /keys ") {
+                    r#"{"keys":[]}"#
+                } else {
+                    &document
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (base, task)
+    }
+
+    fn custom_config(issuer: &str, discovery: Option<String>) -> crate::SsoInternalProviderConfig {
+        serde_json::from_value(json!({
+            "type": "custom",
+            "client_id": "test-client",
+            "client_secret": "test-secret",
+            "issuer_url": issuer,
+            "discovery_url": discovery,
+            "scopes": [],
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn custom_discovery_preserves_issuer_checks_and_isolates_tenants() {
+        let issuer = "https://identity.oraclecloud.com/";
+        let (first, first_task) = discovery_server(Some(issuer)).await;
+        let (second, second_task) = discovery_server(Some(issuer)).await;
+        let client = openidconnect::reqwest::Client::new();
+        let first_config = custom_config(issuer, Some(format!("{first}/discovery")));
+        let second_config = custom_config(issuer, Some(format!("{second}/discovery")));
+        let a = super::discover_metadata(&first_config, &client)
+            .await
+            .unwrap();
+        let b = super::discover_metadata(&second_config, &client)
+            .await
+            .unwrap();
+        assert_eq!(a.issuer().as_str(), issuer);
+        assert_eq!(b.issuer().as_str(), issuer);
+        assert_ne!(a.jwks_uri(), b.jwks_uri());
+        assert_eq!(a.jwks_uri().as_str(), format!("{first}/keys"));
+        let refreshed = super::refresh_metadata(&first_config, &client)
+            .await
+            .unwrap();
+        assert_eq!(refreshed.jwks_uri(), a.jwks_uri());
+
+        let wrong_issuer = custom_config(
+            "https://wrong.example/",
+            first_config.discovery_url().map(ToString::to_string),
+        );
+        let error = super::discover_metadata(&wrong_issuer, &client)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().to_lowercase().contains("issuer"),
+            "{error}"
+        );
+        first_task.abort();
+        second_task.abort();
+    }
+
+    #[tokio::test]
+    async fn standard_discovery_still_works_without_an_override() {
+        let (base, task) = discovery_server(None).await;
+        let config = custom_config(&base, None);
+        let client = openidconnect::reqwest::Client::new();
+        let metadata = super::discover_metadata(&config, &client).await.unwrap();
+        assert_eq!(
+            metadata.authorization_endpoint().as_str(),
+            format!("{base}/authorize")
+        );
+        task.abort();
     }
 }
