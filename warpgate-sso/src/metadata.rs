@@ -117,7 +117,7 @@ pub async fn discover_metadata(
     let key = metadata_cache_key(config)?;
     METADATA_CACHE
         .get_or_build(&key, &(), || async {
-            let metadata = if let Some(url) = config.discovery_url() {
+            if let Some(url) = config.discovery_url() {
                 check_endpoint_scheme("discovery_url", url)?;
                 let metadata: ProviderMetadataWithLogout = http_client
                     .get(url.clone())
@@ -140,12 +140,11 @@ pub async fn discover_metadata(
                 )
                 .await
                 .map_err(|e| SsoError::Discovery(describe_error(&e)))?;
-                metadata.set_jwks(jwks)
-            } else {
-                ProviderMetadataWithLogout::discover_async(issuer, http_client)
-                    .await
-                    .map_err(|e| SsoError::Discovery(describe_error(&e)))?
-            };
+                return Ok(metadata.set_jwks(jwks));
+            }
+            let metadata = ProviderMetadataWithLogout::discover_async(issuer, http_client)
+                .await
+                .map_err(|e| SsoError::Discovery(describe_error(&e)))?;
 
             // Validate before caching, so a hostile document is never served from
             // the cache and never reaches a caller.
