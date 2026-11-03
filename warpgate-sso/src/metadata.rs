@@ -119,14 +119,32 @@ pub async fn discover_metadata(
         .get_or_build(&key, &(), || async {
             if let Some(url) = config.discovery_url() {
                 check_endpoint_scheme("discovery_url", url)?;
-                let metadata: ProviderMetadataWithLogout = http_client
+                let response = http_client
                     .get(url.clone())
                     .header(reqwest::header::ACCEPT, "application/json")
                     .send()
-                    .await?
-                    .error_for_status()?
-                    .json()
-                    .await?;
+                    .await
+                    .map_err(|e| SsoError::Discovery(describe_error(&e)))?;
+                if response.status() != reqwest::StatusCode::OK {
+                    return Err(SsoError::Discovery(format!(
+                        "HTTP status code {} at {url}", response.status()
+                    )));
+                }
+                if let Some(content_type) = response.headers().get(reqwest::header::CONTENT_TYPE)
+                    && !content_type.to_str().ok()
+                        .and_then(|value| value.split(';').next())
+                        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"))
+                {
+                    return Err(SsoError::Discovery(format!(
+                        "unexpected response Content-Type {content_type:?} at {url}; expected application/json"
+                    )));
+                }
+                let body = response.bytes().await
+                    .map_err(|e| SsoError::Discovery(describe_error(&e)))?;
+                let metadata: ProviderMetadataWithLogout = serde_path_to_error::deserialize(
+                    &mut serde_json::Deserializer::from_slice(&body),
+                )
+                .map_err(|e| SsoError::Discovery(describe_error(&e)))?;
                 if metadata.issuer() != &issuer {
                     return Err(SsoError::Discovery(format!(
                         "unexpected issuer URI `{}` (expected `{issuer}`)",
@@ -347,31 +365,47 @@ pub mod tests {
     }
 
     async fn discovery_server(issuer: Option<&str>) -> (String, tokio::task::JoinHandle<()>) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        discovery_response_server(issuer, 200, Some("application/json"), |_| {}).await
+    }
+
+    async fn discovery_response_server(
+        issuer: Option<&str>,
+        status: u16,
+        content_type: Option<&str>,
+        modify: impl FnOnce(&mut Value),
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let document = json!({
+        let mut document = json!({
             "issuer": issuer.unwrap_or(&base),
             "authorization_endpoint": format!("{base}/authorize"),
             "jwks_uri": format!("{base}/keys"),
             "response_types_supported": ["code"],
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["RS256"],
-        })
-        .to_string();
+        });
+        modify(&mut document);
+        let document = document.to_string();
+        let content_type = content_type
+            .map(|value| format!("Content-Type: {value}\r\n"))
+            .unwrap_or_default();
         let task = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = [0; 4096];
-                let size = socket.read(&mut request).await.unwrap();
-                let body = if request[..size].starts_with(b"GET /keys ") {
-                    r#"{"keys":[]}"#
+                let mut request = String::new();
+                BufReader::new(&mut socket)
+                    .read_line(&mut request)
+                    .await
+                    .unwrap();
+                let (status, header, body) = if request.starts_with("GET /keys ") {
+                    (200, "Content-Type: application/json\r\n", r#"{"keys":[]}"#)
                 } else {
-                    &document
+                    (status, content_type.as_str(), document.as_str())
                 };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} Test\r\n{header}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 socket.write_all(response.as_bytes()).await.unwrap();
@@ -443,5 +477,104 @@ pub mod tests {
             format!("{base}/authorize")
         );
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn custom_discovery_rejects_disallowed_schemes_and_endpoints() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let client = openidconnect::reqwest::Client::new();
+        let config = custom_config(
+            "https://issuer.example/",
+            Some("file:///discovery.json".into()),
+        );
+        let error = super::discover_metadata(&config, &client)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, SsoError::UnsupportedEndpointScheme { endpoint, .. } if endpoint == "discovery_url")
+        );
+
+        let (base, task) = discovery_response_server(
+            Some("https://issuer.example/"),
+            200,
+            Some("application/json"),
+            |document| document["authorization_endpoint"] = json!("javascript:alert(1)"),
+        )
+        .await;
+        let config = custom_config("https://issuer.example/", Some(format!("{base}/discovery")));
+        let error = super::discover_metadata(&config, &client)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, SsoError::UnsupportedEndpointScheme { endpoint, .. } if endpoint == "authorization_endpoint")
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn custom_discovery_validates_status_and_preserves_parse_details() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let client = openidconnect::reqwest::Client::new();
+        for (status, content_type, missing, expected) in [
+            (201, "application/json", false, "HTTP status code 201"),
+            (503, "application/json", false, "HTTP status code 503"),
+            (200, "text/html", false, "Content-Type"),
+            (200, "application/json", true, "missing field `issuer`"),
+        ] {
+            let (base, task) = discovery_response_server(
+                Some("https://issuer.example/"),
+                status,
+                Some(content_type),
+                |document| {
+                    if missing {
+                        document.as_object_mut().unwrap().remove("issuer");
+                    }
+                },
+            )
+            .await;
+            let config =
+                custom_config("https://issuer.example/", Some(format!("{base}/discovery")));
+            let error = super::discover_metadata(&config, &client)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SsoError::Discovery(_)), "{error}");
+            assert!(error.to_string().contains(expected), "{error}");
+            task.abort();
+        }
+        let (base, task) = discovery_response_server(
+            Some("https://issuer.example/"),
+            200,
+            Some("application/json"),
+            |document| document["response_types_supported"] = json!([5]),
+        )
+        .await;
+        let config = custom_config("https://issuer.example/", Some(format!("{base}/discovery")));
+        let error = super::discover_metadata(&config, &client)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("response_types_supported[0]"),
+            "{error}"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn custom_discovery_accepts_missing_or_parameterized_json_content_type() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let client = openidconnect::reqwest::Client::new();
+        for content_type in [None, Some("Application/JSON; charset=utf-8")] {
+            let (base, task) = discovery_response_server(
+                Some("https://issuer.example/"),
+                200,
+                content_type,
+                |_| {},
+            )
+            .await;
+            let config =
+                custom_config("https://issuer.example/", Some(format!("{base}/discovery")));
+            super::discover_metadata(&config, &client).await.unwrap();
+            task.abort();
+        }
     }
 }
