@@ -138,7 +138,8 @@ pub async fn discover_metadata(
                 {
                     *request.uri_mut() = uri.clone();
                 }
-                http_client.call(request)
+                let http_client = http_client.clone();
+                async move { http_client.call(request).await }
             };
             let metadata = ProviderMetadataWithLogout::discover_async(issuer, &discovery_client)
                 .await
