@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use openidconnect::url::Url;
-use openidconnect::{AsyncHttpClient, HttpRequest, ProviderMetadataWithLogout, http, reqwest};
+use openidconnect::{ProviderMetadataWithLogout, reqwest};
 use tokio::sync::Mutex;
 use warpgate_common_cache::Cache;
 
@@ -115,35 +115,37 @@ pub async fn discover_metadata(
 ) -> Result<ProviderMetadataWithLogout, SsoError> {
     let issuer = config.issuer_url()?;
     let key = metadata_cache_key(config)?;
-    let default_discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        issuer.as_str().trim_end_matches('/')
-    );
-    let discovery_uri = config
-        .discovery_url()
-        .map(|url| {
-            check_endpoint_scheme("discovery_url", url)?;
-            url.as_str()
-                .parse::<http::Uri>()
-                .map_err(|e| SsoError::ConfigError(format!("invalid discovery_url: {e}")))
-        })
-        .transpose()?;
     METADATA_CACHE
         .get_or_build(&key, &(), || async {
-            // Redirect only the discovery fetch. The OIDC library still validates
-            // the advertised issuer and fetches the advertised JWKS normally.
-            let discovery_client = |mut request: HttpRequest| {
-                if request.uri().to_string() == default_discovery_url
-                    && let Some(uri) = &discovery_uri
-                {
-                    *request.uri_mut() = uri.clone();
+            let metadata = if let Some(url) = config.discovery_url() {
+                check_endpoint_scheme("discovery_url", url)?;
+                let metadata: ProviderMetadataWithLogout = http_client
+                    .get(url.clone())
+                    .header(reqwest::header::ACCEPT, "application/json")
+                    .send()
+                    .await?
+                    .error_for_status()?
+                    .json()
+                    .await?;
+                if metadata.issuer() != &issuer {
+                    return Err(SsoError::Discovery(format!(
+                        "unexpected issuer URI `{}` (expected `{issuer}`)",
+                        metadata.issuer()
+                    )));
                 }
-                let http_client = http_client.clone();
-                async move { http_client.call(request).await }
-            };
-            let metadata = ProviderMetadataWithLogout::discover_async(issuer, &discovery_client)
+                validate_endpoint_schemes(&metadata)?;
+                let jwks = openidconnect::core::CoreJsonWebKeySet::fetch_async(
+                    metadata.jwks_uri(),
+                    http_client,
+                )
                 .await
                 .map_err(|e| SsoError::Discovery(describe_error(&e)))?;
+                metadata.set_jwks(jwks)
+            } else {
+                ProviderMetadataWithLogout::discover_async(issuer, http_client)
+                    .await
+                    .map_err(|e| SsoError::Discovery(describe_error(&e)))?
+            };
 
             // Validate before caching, so a hostile document is never served from
             // the cache and never reaches a caller.
